@@ -1,4 +1,4 @@
-FROM machina/base-ubuntu
+FROM behren/machina-base-ubuntu:latest
 
 # Install ssdeep library
 # RUN cd /tmp && \
