@@ -1,68 +1,77 @@
+from datetime import timedelta, datetime
 import json
 
 import ssdeep
 
-from machina.core.worker import Worker
+from machina.core.periodic_worker import PeriodicWorker
+from machina.core.models import Artifact
+from machina.core.models.utils import resolve_db_node_cls, db_ts_to_fs_fmt
 
-class SimilarityAnalysis(Worker):
-
-    # Invoked explicitly
-    types = []
-
+class SimilarityAnalysis(PeriodicWorker):
+    """Compare ssdeep hashes for configured nodes periodically, create Similar bi-directional relationship where the score meets the configured threshold.  Will not create duplicate Similar relationships.
+    If the threshold is changed between restarts, this module will ADD new relationships if the the new threshold applies.  It will not remove relationships. """
+    
     def __init__(self, *args, **kwargs):
         super(SimilarityAnalysis, self).__init__(*args, **kwargs)
 
-    def callback(self, data, properties):
-        # self.logger.info(data)
-        data = json.loads(data)
+    def callback(self):
+        
         ssdeep_threshold = int(self.config['worker']['ssdeep_threshold'])
         comparison_rules = self.config['worker']['comparison_type_rules']
 
-        # resolve obj
-        obj_cls = self.resolve_db_node_cls(data['type'])
-        obj_node_type = obj_cls.__name__.lower()
-        obj = obj_cls.nodes.get(uid=data['uid'])
-
-        # TODO: smooth this out
-        types_to_compare = []
+        source_types = []
         for stype, ttypes in comparison_rules.items():
-            # ['*']:['*'] everything is compared to everything, also *:['apk'] will act identically - "everything is compared to apk, and apk is compared to everything"
-            if stype == '*' or '*' in ttypes:
-                types_to_compare = self.config['types']['available_types'].copy()
-                # types_to_compare.remove('*')
-                break
-            # ['apk']:['jar','dex']
-            if obj_node_type == stype:
-                types_to_compare = ttypes
-            # ['jar']:['apk','dex']
-            if obj_node_type in ttypes:
-                types_to_compare = [stype]
 
-        self.logger.info(f"Comparing against types: {types_to_compare}")
+            source_types = [stype]
+            source_classes = []
 
-        for type_to_compare in types_to_compare:
-            c = self.resolve_db_node_cls(type_to_compare)
-            targets = c.nodes.all()
-            for t in targets:
-                # avoid comparing with self
-                if t.uid == obj.uid:
-                    continue
-                # ensure node to compare against has ssdeep computed
-                if t.ssdeep:
-                    # do compare
-                    result = ssdeep.compare(obj.ssdeep, t.ssdeep)
-                    # check threshold
-                    if result > ssdeep_threshold:
-                        self.logger.info(f"Establishing similarity link between {obj.uid} {t.uid} with result {result}")
+            target_types = ttypes
+            target_classes = []
 
-                        data = {
-                            "measurements": {
-                                "ssdeep_similarity": result
-                            }
-                        }
+            # '*':['*'] everything is compared to everything, 
+            # also '*':['apk'] will behave like - "everything is compared to apk, and apk is compared to everything"
+            if stype == '*':
+                source_types = self.config['types']['available_types'].copy()
+            if '*' in ttypes:
+                target_types = self.config['types']['available_types'].copy()
 
-                        similarity_rel = obj.similar.connect(t, data).save()
-                    else:
-                        self.logger.info(f"ssdeep comparsion only resulted in similarity of: {result}, not enough for link")
-                else:
-                    self.logger.info(f"No ssdeep for {t.uid}")
+            # resolve classes
+            for source_type in source_types:
+                source_classes.append(resolve_db_node_cls(source_type))
+            for target_type in target_types:
+                target_classes.append(resolve_db_node_cls(target_type))
+
+            for source_class in source_classes:
+                source_nodes = source_class.nodes.filter(ssdeep__isnull=False)
+                for target_class in target_classes:
+                    target_nodes = target_class.nodes.filter(ssdeep__isnull=False)
+
+                    for source_node in source_nodes:
+                        for target_node in target_nodes:
+                            # in the case *:* , dont compare two of the same exact nodes (or identical node data)
+                            if source_node.uid == target_node.uid:
+                                self.logger.debug(f"Skipping comparison to self uid: {source_node.uid}")
+                                continue
+
+                            result = ssdeep.compare(source_node.ssdeep, target_node.ssdeep)
+                            if result > ssdeep_threshold:
+                                data = {
+                                    "measurements": {
+                                        "ssdeep_similarity": result
+                                    }
+                                }
+
+                                # see if these two node already have a relationship
+                                # and if it does, see if the new ssdeep_similarity is different and update
+                                similar_rel = source_node.similar.relationship(target_node)
+                                if similar_rel:
+                                    self.logger.debug(f"This relationship between uid:{source_node.uid} uid:{target_node.uid} already exists..checking to see if scores need updating")
+                                    if similar_rel.measurements['ssdeep_similarity'] != result:
+                                        self.logger.debug(f"New ssdeep score being updated: {result}")
+                                        similar_rel.measurements['ssdeep_similarity'] = result
+                                else:
+                                    self.logger.info(f"Establishing similarity link between uid:{source_node.uid} uid:{target_node.uid} with result {result}")
+                                    similarity_rel = source_node.similar.connect(target_node, data).save()
+                            else:
+                                self.logger.info(f"ssdeep comparison between uid:{source_node.uid} uid:{target_node.uid} only resulted in similarity of: {result}, not enough for link")
+
