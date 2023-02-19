@@ -5,7 +5,7 @@ import ssdeep
 
 from machina.core.periodic_worker import PeriodicWorker
 from machina.core.models import Artifact
-from machina.core.models.utils import resolve_db_node_cls, db_ts_to_fs_fmt
+from machina.core.models.utils import resolve_db_node_cls
 
 class SimilarityAnalysis(PeriodicWorker):
     """Compare ssdeep hashes for configured nodes periodically, create Similar bi-directional relationship where the score meets the configured threshold.  Will not create duplicate Similar relationships.
